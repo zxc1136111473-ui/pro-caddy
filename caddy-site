@@ -130,12 +130,56 @@ scan_services() {
   fi
 }
 
+# 从站点文件读出后端 "host port"
+site_get_backend() {
+  local rp; rp="$(grep -oE 'reverse_proxy[[:space:]]+[^[:space:]]+' "$1" | awk '{print $2}')"
+  printf '%s %s' "${rp%:*}" "${rp##*:}"
+}
+# 交互读两遍密码，用 caddy hash-password 生成，打印 basic_auth 块到 stdout（提示走 stderr）
+mk_authblock() {
+  local user="$1" pw="" pw2="" hash
+  printf '  设访问密码（用户名：%s）\n' "$user" >&2
+  printf '  密码（不回显）: ' >&2; IFS= read -rs pw </dev/tty || true; printf '\n' >&2
+  [ -n "$pw" ] || { echo "密码为空，取消" >&2; return 1; }
+  printf '  再输一遍: ' >&2; IFS= read -rs pw2 </dev/tty || true; printf '\n' >&2
+  [ "$pw" = "$pw2" ] || { echo "两次不一致" >&2; return 1; }
+  hash="$(printf '%s\n' "$pw" | caddy hash-password 2>/dev/null)" || { echo "生成哈希失败" >&2; return 1; }
+  printf '\tbasic_auth {\n\t\t%s %s\n\t}' "$user" "$hash"
+}
+# 写站点文件（不校验不 reload），authblock 为空则无密码
+write_site_file() {
+  local out="$1" domain="$2" host="$3" port="$4" authblock="$5"
+  { printf '%s {\n' "$domain"
+    [ -n "$authblock" ] && printf '%s\n' "$authblock"
+    printf '\treverse_proxy %s:%s\n}\n' "$host" "$port"
+  } > "$out"
+}
+
+# 给已有站点加/改/去掉访问密码
+cmd_auth() {
+  local domain="" user="admin" off=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --user) user="${2:?}"; shift 2 ;; --off) off=1; shift ;; -*) die "未知参数：$1" ;; *) domain="$1"; shift ;; esac
+  done
+  [ -n "$domain" ] || die "用法：caddy-site auth <域名> [--user 用户] [--off]"
+  local f; f="$(site_file "$domain")"; [ -f "$f" ] || die "没有这个站点：$domain"
+  local host port; read -r host port <<<"$(site_get_backend "$f")"
+  local authblock=""
+  [ "$off" = 0 ] && { authblock="$(mk_authblock "$user")" || die "没设成密码，站点没动"; }
+  local bak; bak="$(mktemp)"; cp "$f" "$bak"
+  write_site_file "$f" "$domain" "$host" "$port" "$authblock"; chmod 0644 "$f"
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then mv "$bak" "$f"; die "配置校验没过，已回滚"; fi
+  rm -f "$bak"; reload_caddy
+  [ "$off" = 1 ] && ok "已去掉 ${domain} 的访问密码" || ok "已给 ${domain} 设访问密码（用户 ${user}）"
+}
+
 cmd_add() {
-  local domain="" port="" host="127.0.0.1" dnscheck=1
+  local domain="" port="" host="127.0.0.1" dnscheck=1 authuser=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --host) host="${2:?--host 后要给地址}"; shift 2 ;;
       --no-dns-check) dnscheck=0; shift ;;
+      --auth) authuser="${2:?}"; shift 2 ;;
       -*) die "未知参数：$1" ;;
       *) if [ -z "$domain" ]; then domain="$1"; elif [ -z "$port" ]; then port="$1"; else die "多余参数：$1"; fi; shift ;;
     esac
@@ -161,8 +205,10 @@ cmd_add() {
   fi
 
   [ -f "$f" ] && warn "${domain} 已存在，覆盖为 -> ${host}:${port}"
+  local authblock=""
+  [ -n "$authuser" ] && { authblock="$(mk_authblock "$authuser")" || die "没设成密码，取消（站点没动）"; }
   local tmp; tmp="$(mktemp)"
-  printf '%s {\n\treverse_proxy %s:%s\n}\n' "$domain" "$host" "$port" > "$tmp"
+  write_site_file "$tmp" "$domain" "$host" "$port" "$authblock"
 
   local bak=""; [ -f "$f" ] && { bak="$(mktemp)"; cp "$f" "$bak"; }
   mv "$tmp" "$f"
@@ -306,7 +352,9 @@ menu_add() {
   fi
   local domain; read -rp "  域名: " domain
   [ -n "$domain" ] || { warn "没填域名，取消"; return 0; }
-  cmd_add "$domain" "$port" --host "$host" || true
+  local au=""; local yn; read -rp "  加访问密码吗？(y/N) " yn
+  case "$yn" in y|Y|yes) local u; read -rp "  用户名 [admin]: " u; au="--auth ${u:-admin}" ;; esac
+  cmd_add "$domain" "$port" --host "$host" $au || true
 }
 
 menu_rm() {
@@ -335,6 +383,7 @@ menu() {
     say "  5) 体检（证书到期 / 端口占用 / 磁盘）"
     say "  6) 修端口（80/443 被别的程序占了，腾出来）"
     say "  7) 诊断某域名为啥没签下来"
+    say "  8) 给站点加/改/去掉访问密码"
     say "  0) 退出"
     local c; read -rp "  选: " c || break
     case "$c" in
@@ -345,6 +394,7 @@ menu() {
       5) cmd_status ;;
       6) cmd_fixports ;;
       7) local d; read -rp "  域名: " d; [ -n "$d" ] && show_why "$d" ;;
+      8) local d2 u2 off2; read -rp "  域名: " d2; [ -n "$d2" ] || continue; read -rp "  去掉密码填 off，否则回车设密码: " off2; if [ "$off2" = off ]; then cmd_auth "$d2" --off; else read -rp "  用户名 [admin]: " u2; cmd_auth "$d2" --user "${u2:-admin}"; fi ;;
       0|"") break ;;
       *) warn "没这个选项" ;;
     esac
@@ -361,6 +411,8 @@ show_help() {
   say "  caddy-site status              体检：证书到期 / 80,443 占用 / 磁盘内存"
   say "  caddy-site fix-ports           80/443 被别的程序占时，确认后停掉它并拉起 Caddy"
   say "  caddy-site why <域名>          证书没签下来时，从 Caddy 日志找真实原因"
+  say "  caddy-site add ... --auth <用户>  加站点时顺带设访问密码"
+  say "  caddy-site auth <域名> [--user u] [--off]  给已有站点加/改/去掉密码"
 }
 
 need_root
@@ -373,6 +425,7 @@ case "${1:-}" in
   status|check|体检) cmd_status ;;
   fix-ports|fixports) cmd_fixports ;;
   why|诊断) shift; [ -n "${1:-}" ] || die "用法：caddy-site why <域名>"; show_why "$1" ;;
+  auth) shift; cmd_auth "$@" ;;
   menu)   menu ;;
   -h|--help) show_help ;;
   "")     if [ -t 0 ]; then menu; else show_help; fi ;;

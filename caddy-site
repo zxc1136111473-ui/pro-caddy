@@ -52,6 +52,27 @@ reload_caddy() {
 
 site_file() { printf '%s/%s.caddy' "$SITES_DIR" "$1"; }
 
+# 证书签不下来时，从 Caddy 日志抓真实原因并翻译成人话
+show_why() {
+  local domain="$1" errs
+  errs="$(journalctl -u caddy --no-pager --since '5 min ago' 2>/dev/null \
+    | grep -F "$domain" \
+    | grep -iE 'error|challenge|obtain|rate|refused|timeout|unauthoriz|no records|failed|dial tcp' \
+    | tail -6 || true)"
+  if [ -z "$errs" ]; then
+    warn "没从 Caddy 日志抓到 ${domain} 的报错（可能还在重试，或其实已经好了）。看全量：journalctl -u caddy -n 50"
+    return 0
+  fi
+  say "  Caddy 日志里 ${domain} 的相关记录："
+  printf '%s\n' "$errs" | sed 's/^/    /'
+  case "$errs" in
+    *rate*limit*|*429*)        warn "→ 撞 Let's Encrypt 限流：同一域名失败太多次，等约 1 小时再 add" ;;
+    *refused*|*timeout*|*'dial tcp'*) warn "→ 80/443 从公网连不上：多半是云安全组/防火墙没放行 80 和 443" ;;
+    *'no records'*|*NXDOMAIN*|*'DNS problem'*) warn "→ 域名没解析对：A 记录要指到本机 $(my_ip 2>/dev/null)" ;;
+    *unauthoriz*|*challenge*)  warn "→ 挑战验证没过：通常是 80 没真正到达 Caddy（被别的东西占了或被挡）" ;;
+  esac
+}
+
 # 查某端口被谁占着，打印「是谁 + 怎么停」（容器 / 系统服务 / 裸进程）
 port_who() {
   local port="$1" line name pid unit cid
@@ -164,7 +185,7 @@ cmd_add() {
   done
   case "$code" in
     2*|3*|401|403) ok "https://${domain} 已通（HTTP ${code}），证书已签发" ;;
-    "") warn "https://${domain} 三十秒还没通——查下 DNS 和 80/443，或稍后 caddy-site status 看证书" ;;
+    "") warn "https://${domain} 三十秒还没通，看看 Caddy 报的原因："; show_why "$domain" ;;
     *) warn "https://${domain} 返回 HTTP ${code}（后端 ${host}:${port} 没起来？）" ;;
   esac
 }
@@ -313,6 +334,7 @@ menu() {
     say "  4) reload"
     say "  5) 体检（证书到期 / 端口占用 / 磁盘）"
     say "  6) 修端口（80/443 被别的程序占了，腾出来）"
+    say "  7) 诊断某域名为啥没签下来"
     say "  0) 退出"
     local c; read -rp "  选: " c || break
     case "$c" in
@@ -322,6 +344,7 @@ menu() {
       4) reload_caddy && ok "已 reload" ;;
       5) cmd_status ;;
       6) cmd_fixports ;;
+      7) local d; read -rp "  域名: " d; [ -n "$d" ] && show_why "$d" ;;
       0|"") break ;;
       *) warn "没这个选项" ;;
     esac
@@ -337,6 +360,7 @@ show_help() {
   say "  caddy-site reload"
   say "  caddy-site status              体检：证书到期 / 80,443 占用 / 磁盘内存"
   say "  caddy-site fix-ports           80/443 被别的程序占时，确认后停掉它并拉起 Caddy"
+  say "  caddy-site why <域名>          证书没签下来时，从 Caddy 日志找真实原因"
 }
 
 need_root
@@ -348,6 +372,7 @@ case "${1:-}" in
   reload) reload_caddy; ok "已 reload" ;;
   status|check|体检) cmd_status ;;
   fix-ports|fixports) cmd_fixports ;;
+  why|诊断) shift; [ -n "${1:-}" ] || die "用法：caddy-site why <域名>"; show_why "$1" ;;
   menu)   menu ;;
   -h|--help) show_help ;;
   "")     if [ -t 0 ]; then menu; else show_help; fi ;;

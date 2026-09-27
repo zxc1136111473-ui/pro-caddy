@@ -52,6 +52,22 @@ reload_caddy() {
 
 site_file() { printf '%s/%s.caddy' "$SITES_DIR" "$1"; }
 
+# 查某端口被谁占着，打印「是谁 + 怎么停」（容器 / 系统服务 / 裸进程）
+port_who() {
+  local port="$1" line name pid unit cid
+  line="$(ss -ltnpH "sport = :$port" 2>/dev/null | head -1 || true)"
+  [ -n "$line" ] || { echo "没人听"; return 1; }
+  name="$(printf '%s' "$line" | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
+  pid="$(printf '%s' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+  # Docker 容器？
+  cid="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | awk -v p=":${port}->" 'index($0,p){print $1; exit}' || true)"
+  if [ -n "$cid" ]; then echo "容器 ${cid} 发布了 :${port}"; echo "停它：docker stop ${cid}"; return 0; fi
+  # systemd 服务？
+  unit=""; [ -n "$pid" ] && unit="$(awk -F/ '/\.service/{print $NF; exit}' "/proc/$pid/cgroup" 2>/dev/null || true)"
+  if [ -n "$unit" ]; then echo "系统服务 ${unit}（进程 ${name}，pid ${pid}）"; echo "停它：systemctl disable --now ${unit%.service}"; return 0; fi
+  echo "进程 ${name}（pid ${pid}）"; echo "停它：kill ${pid}（先确认它是什么）"
+}
+
 # 某端口是否已配了域名（配了就返回域名）
 port_domain() {
   local p="$1" f
@@ -183,7 +199,11 @@ cmd_status() {
     who="$(ss -ltnpH "sport = :$p" 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
     if [ -z "$who" ]; then warn "${p} 端口没人听（Caddy 没绑上？）"
     elif [ "$who" = caddy ]; then ok "${p} 端口：caddy"
-    else warn "${p} 端口被 ${who} 占着（不是 caddy！会导致证书签发/续签失败）"; fi
+    else
+      warn "${p} 端口被 ${who} 占着（不是 caddy！会导致证书签发/续签失败）"
+      port_who "$p" | sed 's/^/       /'
+      say "       想让脚本帮你腾出来：菜单选「6) 修端口」"
+    fi
   done
   # 每个域名证书到期
   say "  证书到期（Caddy 自动续，剩约 30 天时续）："
@@ -203,6 +223,31 @@ cmd_status() {
   dpct="$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
   if [ "${dpct:-0}" -ge 85 ]; then warn "磁盘：${duse}（快满了，清 docker 缓存/出图）"; else ok "磁盘：${duse}"; fi
   command -v free >/dev/null 2>&1 && say "  内存：$(free -h 2>/dev/null | awk '/^(Mem|Speicher)/{print $3" / "$2}')   swap：$(free -h 2>/dev/null | awk '/^Swap/{print $3" / "$2}')"
+}
+
+# 80/443 被非 caddy 占用时，指出是谁、确认后停掉它并拉起 Caddy（不自动杀，必须你点头）
+cmd_fixports() {
+  local port line name pid unit cid changed=0
+  for port in 80 443; do
+    line="$(ss -ltnpH "sport = :$port" 2>/dev/null | head -1 || true)"
+    name="$(printf '%s' "$line" | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
+    if [ -z "$name" ]; then warn "${port} 没人听（Caddy 没起来？下面会尝试重启）"; changed=1; continue; fi
+    if [ "$name" = caddy ]; then ok "${port}：caddy，正常"; continue; fi
+    say ""; warn "${port} 被非 caddy 占用："
+    port_who "$port" | sed 's/^/    /'
+    pid="$(printf '%s' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+    cid="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | awk -v p=":${port}->" 'index($0,p){print $1; exit}' || true)"
+    unit=""; [ -n "$pid" ] && unit="$(awk -F/ '/\.service/{print $NF; exit}' "/proc/$pid/cgroup" 2>/dev/null || true)"
+    local yn; read -rp "  停掉它？(y/N) " yn
+    case "$yn" in y|Y|yes) : ;; *) say "  跳过"; continue ;; esac
+    if [ -n "$cid" ]; then docker stop "$cid" >/dev/null && ok "  已停容器 ${cid}" && changed=1
+    elif [ -n "$unit" ]; then systemctl disable --now "${unit%.service}" && ok "  已停 ${unit}" && changed=1
+    else warn "  认不出怎么停（进程 ${name} pid ${pid}），你自己确认后 kill ${pid}"; fi
+  done
+  if [ "$changed" = 1 ]; then
+    say "  重启 Caddy…"
+    if systemctl restart caddy; then sleep 2; systemctl is-active caddy >/dev/null && ok "Caddy 已起来"; else warn "Caddy 还是没起来，看 journalctl -u caddy -n 20"; fi
+  fi
 }
 
 # ── 交互菜单 ──────────────────────────────────────────────────────────────
@@ -261,6 +306,7 @@ menu() {
     say "  3) 刷新"
     say "  4) reload"
     say "  5) 体检（证书到期 / 端口占用 / 磁盘）"
+    say "  6) 修端口（80/443 被别的程序占了，腾出来）"
     say "  0) 退出"
     local c; read -rp "  选: " c || break
     case "$c" in
@@ -269,6 +315,7 @@ menu() {
       3) : ;;
       4) reload_caddy && ok "已 reload" ;;
       5) cmd_status ;;
+      6) cmd_fixports ;;
       0|"") break ;;
       *) warn "没这个选项" ;;
     esac
@@ -283,6 +330,7 @@ show_help() {
   say "  caddy-site list"
   say "  caddy-site reload"
   say "  caddy-site status              体检：证书到期 / 80,443 占用 / 磁盘内存"
+  say "  caddy-site fix-ports           80/443 被别的程序占时，确认后停掉它并拉起 Caddy"
 }
 
 need_root
@@ -293,6 +341,7 @@ case "${1:-}" in
   list|ls) cmd_list ;;
   reload) reload_caddy; ok "已 reload" ;;
   status|check|体检) cmd_status ;;
+  fix-ports|fixports) cmd_fixports ;;
   menu)   menu ;;
   -h|--help) show_help ;;
   "")     if [ -t 0 ]; then menu; else show_help; fi ;;

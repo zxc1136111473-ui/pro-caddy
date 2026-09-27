@@ -68,7 +68,40 @@ caddy-site list
 
 # 手动校验并重载
 caddy-site reload
+
+# 体检：证书到期 / 80,443 被谁占 / 磁盘内存
+caddy-site status
+
+# 80/443 被别的程序占了：指出是谁 + 确认后停掉它并拉起 Caddy
+caddy-site fix-ports
+
+# 证书没签下来：从 Caddy 日志找真实原因（限流 / DNS / 80,443 不通 / 挑战失败）
+caddy-site why a.example.com
+
+# 给站点加访问密码（basic_auth），或去掉
+caddy-site add a.example.com 8613 --auth admin
+caddy-site auth a.example.com --user admin
+caddy-site auth a.example.com --off
+
+# 看某域名在 Caddy 日志里的记录
+caddy-site logs a.example.com [-f]
+
+# 健康检查（证书快到期<20天 / 端口被占 / 磁盘满）；--notify 时推送到 NOTIFY_URL
+caddy-site health
 ```
+
+## 定时告警（可选）
+
+想每天自动查、有问题就推手机：
+
+```bash
+# 1) 填推送地址（Bark / 或任意接受 POST 的 webhook）
+echo 'NOTIFY_URL=https://api.day.app/你的KEY' > /etc/caddy-site.env
+# 2) 每天 08:00 检查，有问题才推
+echo '0 8 * * * root caddy-site health --notify >/dev/null 2>&1' > /etc/cron.d/caddy-health
+```
+
+没填 `NOTIFY_URL` 也没关系——`health` 照常把问题写进 `/var/log/caddy-health.log`。
 
 ## 说明
 

@@ -323,6 +323,60 @@ cmd_fixports() {
   fi
 }
 
+# 看某域名在 Caddy 日志里的记录（证书/错误；默认不记每条访问）
+cmd_logs() {
+  local domain="${1:-}"; [ -n "$domain" ] || die "用法：caddy-site logs <域名> [-f]"
+  if [ "${2:-}" = -f ]; then
+    say "跟随 ${domain} 的 Caddy 日志（Ctrl+C 退出）…"
+    journalctl -u caddy -f --no-pager 2>/dev/null | grep --line-buffered -F "$domain"
+  else
+    local out; out="$(journalctl -u caddy -n 300 --no-pager 2>/dev/null | grep -F "$domain" | tail -40 || true)"
+    if [ -n "$out" ]; then printf '%s\n' "$out"
+    else warn "最近日志里没提到 ${domain}（Caddy 默认只记证书/错误，不记每条访问）"; fi
+  fi
+}
+
+# 健康检查：证书快到期(<20天)/80,443被占/Caddy没跑/磁盘满 —— 有问题打印并（--notify 时）推送
+cmd_health() {
+  local notify=0; [ "${1:-}" = --notify ] && notify=1
+  local problems="" now days f domain crt end p who dpct
+  systemctl is-active caddy >/dev/null 2>&1 || problems="${problems}
+- Caddy 服务没在跑"
+  for p in 80 443; do
+    who="$(ss -ltnpH "sport = :$p" 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)"
+    [ "$who" = caddy ] || problems="${problems}
+- ${p} 端口被 ${who:-无人} 占（不是 caddy）"
+  done
+  now="$(date +%s)"; shopt -s nullglob
+  for f in "$SITES_DIR"/*.caddy; do
+    domain="$(basename "$f" .caddy)"
+    crt="$(find /var/lib/caddy -type f -path "*/${domain}/*.crt" 2>/dev/null | head -1 || true)"
+    if [ -z "$crt" ]; then problems="${problems}
+- ${domain} 证书还没签下来"; continue; fi
+    end="$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//')"
+    days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo "$now") - now ) / 86400 ))
+    [ "$days" -lt 20 ] && problems="${problems}
+- ${domain} 证书 ${days} 天后到期"
+  done
+  dpct="$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+  [ "${dpct:-0}" -ge 90 ] && problems="${problems}
+- 磁盘用了 ${dpct}%（快满）"
+  if [ -z "$problems" ]; then [ "$notify" = 1 ] || ok "健康：证书、端口、磁盘都正常"; return 0; fi
+  local msg="[caddy-site 告警] $(hostname):${problems}"
+  printf '%s\n' "$msg"
+  if [ "$notify" = 1 ]; then
+    echo "$(date '+%F %T')${problems}" >> /var/log/caddy-health.log 2>/dev/null || true
+    [ -f /etc/caddy-site.env ] && . /etc/caddy-site.env
+    if [ -n "${NOTIFY_URL:-}" ]; then
+      case "$NOTIFY_URL" in
+        *day.app*) curl -fsS -m 10 "$NOTIFY_URL" --data-urlencode "title=caddy-site 告警" --data-urlencode "body=${problems}" >/dev/null 2>&1 || true ;;
+        *) curl -fsS -m 10 -X POST --data-urlencode "text=${msg}" "$NOTIFY_URL" >/dev/null 2>&1 || true ;;
+      esac
+    fi
+  fi
+  return 1
+}
+
 # ── 交互菜单 ──────────────────────────────────────────────────────────────
 menu_add() {
   say ""; say "扫描本机服务…"
@@ -384,6 +438,7 @@ menu() {
     say "  6) 修端口（80/443 被别的程序占了，腾出来）"
     say "  7) 诊断某域名为啥没签下来"
     say "  8) 给站点加/改/去掉访问密码"
+    say "  9) 看某域名日志"
     say "  0) 退出"
     local c; read -rp "  选: " c || break
     case "$c" in
@@ -394,6 +449,7 @@ menu() {
       5) cmd_status ;;
       6) cmd_fixports ;;
       7) local d; read -rp "  域名: " d; [ -n "$d" ] && show_why "$d" ;;
+      9) local dl; read -rp "  域名: " dl; [ -n "$dl" ] && cmd_logs "$dl" ;;
       8) local d2 u2 off2; read -rp "  域名: " d2; [ -n "$d2" ] || continue; read -rp "  去掉密码填 off，否则回车设密码: " off2; if [ "$off2" = off ]; then cmd_auth "$d2" --off; else read -rp "  用户名 [admin]: " u2; cmd_auth "$d2" --user "${u2:-admin}"; fi ;;
       0|"") break ;;
       *) warn "没这个选项" ;;
@@ -413,6 +469,8 @@ show_help() {
   say "  caddy-site why <域名>          证书没签下来时，从 Caddy 日志找真实原因"
   say "  caddy-site add ... --auth <用户>  加站点时顺带设访问密码"
   say "  caddy-site auth <域名> [--user u] [--off]  给已有站点加/改/去掉密码"
+  say "  caddy-site logs <域名> [-f]    看该域名在 Caddy 日志里的证书/错误记录"
+  say "  caddy-site health [--notify]   健康检查（证书快到期/端口被占/磁盘满），给定时告警用"
 }
 
 need_root
@@ -426,6 +484,8 @@ case "${1:-}" in
   fix-ports|fixports) cmd_fixports ;;
   why|诊断) shift; [ -n "${1:-}" ] || die "用法：caddy-site why <域名>"; show_why "$1" ;;
   auth) shift; cmd_auth "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  health) shift; cmd_health "$@" ;;
   menu)   menu ;;
   -h|--help) show_help ;;
   "")     if [ -t 0 ]; then menu; else show_help; fi ;;

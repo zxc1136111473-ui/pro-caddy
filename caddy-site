@@ -170,6 +170,41 @@ cmd_list() {
   done
 }
 
+# ── 体检 ──────────────────────────────────────────────────────────────────
+cmd_status() {
+  say ""
+  say "${BLD}== caddy-site 体检 ==${RST}"
+  # Caddy 服务
+  local ca; ca="$(systemctl is-active caddy 2>/dev/null || echo unknown)"
+  if [ "$ca" = active ]; then ok "Caddy 服务：运行中"; else warn "Caddy 服务：${ca}（站点会全挂，证书也不续）"; fi
+  # 80/443 占用（不是 caddy 就危险——续签会失败）
+  local p who
+  for p in 80 443; do
+    who="$(ss -ltnpH "sport = :$p" 2>/dev/null | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
+    if [ -z "$who" ]; then warn "${p} 端口没人听（Caddy 没绑上？）"
+    elif [ "$who" = caddy ]; then ok "${p} 端口：caddy"
+    else warn "${p} 端口被 ${who} 占着（不是 caddy！会导致证书签发/续签失败）"; fi
+  done
+  # 每个域名证书到期
+  say "  证书到期（Caddy 自动续，剩约 30 天时续）："
+  shopt -s nullglob
+  local f domain crt end days now; now="$(date +%s)"
+  for f in "$SITES_DIR"/*.caddy; do
+    domain="$(basename "$f" .caddy)"
+    crt="$(find /var/lib/caddy -type f -path "*/${domain}/*.crt" 2>/dev/null | head -1 || true)"
+    if [ -z "$crt" ]; then printf '    %-28s %s还没签下来%s\n' "$domain" "$YLW" "$RST"; continue; fi
+    end="$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//')"
+    days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo "$now") - now ) / 86400 ))
+    if [ "$days" -lt 20 ]; then printf '    %-28s %s%s 天后到期%s（%s）\n' "$domain" "$RED" "$days" "$RST" "$end"
+    else printf '    %-28s %s 天后到期（自动续）\n' "$domain" "$days"; fi
+  done
+  # 磁盘 / 内存
+  local duse dpct; duse="$(df -h / 2>/dev/null | awk 'NR==2{print $5" 用，"$4" 剩"}')"
+  dpct="$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+  if [ "${dpct:-0}" -ge 85 ]; then warn "磁盘：${duse}（快满了，清 docker 缓存/出图）"; else ok "磁盘：${duse}"; fi
+  command -v free >/dev/null 2>&1 && say "  内存：$(free -h 2>/dev/null | awk '/^(Mem|Speicher)/{print $3" / "$2}')   swap：$(free -h 2>/dev/null | awk '/^Swap/{print $3" / "$2}')"
+}
+
 # ── 交互菜单 ──────────────────────────────────────────────────────────────
 menu_add() {
   say ""; say "扫描本机服务…"
@@ -225,6 +260,7 @@ menu() {
     say "  2) 删站点"
     say "  3) 刷新"
     say "  4) reload"
+    say "  5) 体检（证书到期 / 端口占用 / 磁盘）"
     say "  0) 退出"
     local c; read -rp "  选: " c || break
     case "$c" in
@@ -232,6 +268,7 @@ menu() {
       2) menu_rm ;;
       3) : ;;
       4) reload_caddy && ok "已 reload" ;;
+      5) cmd_status ;;
       0|"") break ;;
       *) warn "没这个选项" ;;
     esac
@@ -245,6 +282,7 @@ show_help() {
   say "  caddy-site rm  <域名>"
   say "  caddy-site list"
   say "  caddy-site reload"
+  say "  caddy-site status              体检：证书到期 / 80,443 占用 / 磁盘内存"
 }
 
 need_root
@@ -254,6 +292,7 @@ case "${1:-}" in
   rm|remove|del) shift; cmd_rm "$@" ;;
   list|ls) cmd_list ;;
   reload) reload_caddy; ok "已 reload" ;;
+  status|check|体检) cmd_status ;;
   menu)   menu ;;
   -h|--help) show_help ;;
   "")     if [ -t 0 ]; then menu; else show_help; fi ;;

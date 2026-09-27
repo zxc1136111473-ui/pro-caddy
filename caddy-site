@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# caddy-site —— 管理 Caddy 的多站点反代：一个域名一个文件，加/删/列一条命令。
+#
+#   caddy-site add <域名> <本机端口> [--host 127.0.0.1] [--no-dns-check]
+#   caddy-site rm  <域名>
+#   caddy-site list
+#   caddy-site reload
+#
+# 设计要点（就是为了解决「加新项目就冲突、证书下不来」）：
+#   · 每个域名单独一个 /etc/caddy/sites/<域名>.caddy，互不影响
+#   · 每次改动都先 `caddy validate` 通过、再 reload —— 一个站点配错
+#     绝不会拖垮其它站点的证书
+#   · add 前先查域名有没有解析到本机（没解析就签不下证书，这里直接拦住）
+set -euo pipefail
+
+SITES_DIR="${CADDY_SITES_DIR:-/etc/caddy/sites}"
+CADDYFILE="${CADDYFILE:-/etc/caddy/Caddyfile}"
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLD=$'\033[1m'; RST=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '%s!%s %s\n' "$YLW" "$RST" "$*"; }
+die()  { printf '%s✗ %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "要 root（sudo caddy-site ...）"; }
+have_caddy() { command -v caddy >/dev/null 2>&1 || die "没找到 caddy，先装 Caddy"; }
+
+# 本机公网 IP（给 DNS 预检用）
+my_ip() {
+  curl -fsS -m 5 https://api.ipify.org 2>/dev/null \
+    || curl -fsS -m 5 https://ifconfig.me 2>/dev/null \
+    || hostname -I 2>/dev/null | awk '{print $1}'
+}
+# 域名解析到的 IPv4（优先 getent，退回 dig）
+resolve_ip() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}' \
+    || { command -v dig >/dev/null 2>&1 && dig +short "$1" A 2>/dev/null | grep -E '^[0-9.]+$' | tail -1; }
+}
+
+reload_caddy() {
+  caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 \
+    || die "Caddy 配置校验没过（改动未生效，先修好）"
+  if systemctl list-unit-files caddy.service >/dev/null 2>&1; then
+    systemctl reload caddy
+  else
+    caddy reload --config "$CADDYFILE" --adapter caddyfile
+  fi
+}
+
+site_file() { printf '%s/%s.caddy' "$SITES_DIR" "$1"; }
+
+cmd_add() {
+  local domain="" port="" host="127.0.0.1" dnscheck=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host="${2:?--host 后要给地址}"; shift 2 ;;
+      --no-dns-check) dnscheck=0; shift ;;
+      -*) die "未知参数：$1" ;;
+      *) if [ -z "$domain" ]; then domain="$1"; elif [ -z "$port" ]; then port="$1"; else die "多余参数：$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$domain" ] && [ -n "$port" ] || die "用法：caddy-site add <域名> <端口> [--host 127.0.0.1] [--no-dns-check]"
+  [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]+$ ]] || die "域名格式不对：$domain"
+  [[ "$port" =~ ^[1-9][0-9]*$ ]] && [ "$port" -le 65535 ] || die "端口不对：$port"
+
+  local f; f="$(site_file "$domain")"
+  mkdir -p "$SITES_DIR"
+
+  # DNS 预检：没解析到本机就直接拦，免得反复触发签发失败、撞 Let's Encrypt 限流
+  if [ "$dnscheck" = 1 ]; then
+    local rip mip; rip="$(resolve_ip "$domain" || true)"; mip="$(my_ip || true)"
+    if [ -z "$rip" ]; then
+      die "$domain 没有 A 记录（先在域名后台解析到本机 ${mip:-本机IP}，或加 --no-dns-check）"
+    elif [ -n "$mip" ] && [ "$rip" != "$mip" ]; then
+      die "$domain 解析到 ${rip}，本机是 $mip —— 证书签不下来。改对解析，或加 --no-dns-check"
+    fi
+  fi
+
+  # 端口有没有服务在听（只提醒，不拦——服务可能晚点起）
+  if command -v ss >/dev/null 2>&1 && ! ss -ltn 2>/dev/null | grep -qE "[.:]${port}[[:space:]]"; then
+    warn "本机 ${port} 端口暂时没监听，先写上，等后端起来即可"
+  fi
+
+  [ -f "$f" ] && warn "$domain 已存在，覆盖为 -> ${host}:${port}"
+  local tmp; tmp="$(mktemp)"
+  printf '%s {\n\treverse_proxy %s:%s\n}\n' "$domain" "$host" "$port" > "$tmp"
+
+  # 先落到临时文件校验整体配置，过了再就位——配错不影响现有站点
+  local bak=""; [ -f "$f" ] && { bak="$(mktemp)"; cp "$f" "$bak"; }
+  mv "$tmp" "$f"
+  chmod 0644 "$f"   # caddy 服务以 caddy 用户运行，要能读到（Caddyfile 无密码）
+  if ! caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+    if [ -n "$bak" ]; then mv "$bak" "$f"; else rm -f "$f"; fi
+    die "加上 $domain 后配置校验没过，已回滚（没动现有站点）"
+  fi
+  [ -n "$bak" ] && rm -f "$bak"
+  reload_caddy
+  ok "$domain -> ${host}:${port}（Caddy 会自动签发/续期证书）"
+
+  # 顺手验一下（证书首次签发要十几秒，失败只提示）
+  sleep 3
+  local code; code="$(curl -sS -o /dev/null -w '%{http_code}' -m 20 "https://$domain/" 2>/dev/null || true)"
+  case "$code" in
+    2*|3*|401|403) ok "https://$domain 已通（HTTP ${code}）" ;;
+    "") warn "https://$domain 暂时没通——证书可能还在签，过十几秒再看 caddy-site list" ;;
+    *) warn "https://$domain 返回 HTTP ${code}（后端没起来？看该端口的服务）" ;;
+  esac
+}
+
+cmd_rm() {
+  local domain="${1:?用法：caddy-site rm <域名>}"
+  local f; f="$(site_file "$domain")"
+  [ -f "$f" ] || die "没有这个站点：$domain"
+  rm -f "$f"
+  reload_caddy
+  ok "已删除 ${domain}（证书文件保留，Caddy 会自然过期清理）"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local files=("$SITES_DIR"/*.caddy) f domain port up
+  if [ "${#files[@]}" = 0 ]; then say "（还没有站点，用 caddy-site add 添加）"; return 0; fi
+  printf '%-32s %-22s %s\n' "域名" "后端" "后端在线"
+  for f in "${files[@]}"; do
+    domain="$(basename "$f" .caddy)"
+    port="$(grep -oE 'reverse_proxy[[:space:]]+[^[:space:]]+' "$f" | awk '{print $2}')"
+    up="${RED}✗${RST}"
+    if command -v ss >/dev/null 2>&1; then
+      local p="${port##*:}"
+      ss -ltn 2>/dev/null | grep -qE "[.:]${p}[[:space:]]" && up="${GRN}✓${RST}"
+    else up="?"; fi
+    printf '%-32s %-22s %b\n' "$domain" "$port" "$up"
+  done
+}
+
+need_root
+have_caddy
+case "${1:-}" in
+  add)    shift; cmd_add "$@" ;;
+  rm|remove|del) shift; cmd_rm "$@" ;;
+  list|ls) cmd_list ;;
+  reload) reload_caddy; ok "已 reload" ;;
+  ""|-h|--help)
+    say "caddy-site —— Caddy 多站点反代管理"
+    say "  caddy-site add <域名> <端口> [--host 127.0.0.1] [--no-dns-check]"
+    say "  caddy-site rm  <域名>"
+    say "  caddy-site list"
+    say "  caddy-site reload" ;;
+  *) die "未知命令：$1（--help 看用法）" ;;
+esac
